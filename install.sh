@@ -2,7 +2,7 @@
 # rtmux remote installer - Run on any PC to join your rtmux fleet
 # Usage: curl -sL https://raw.githubusercontent.com/adaptationio/tmux/main/install-remote.sh | bash
 # Auto:  curl -sL ... | bash -s -- --key tskey-auth-XXXXX --name laptop --manager adaptation
-set -euo pipefail
+set -uo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
@@ -105,12 +105,15 @@ if [[ "$TS_STATUS" == "true" ]]; then
 else
     if [[ -n "$TS_KEY" ]]; then
         # Auto-authenticate with auth key — no browser needed
-        sudo tailscale up --ssh --authkey="$TS_KEY" 2>/dev/null
+        # Try with --ssh first, fall back without it
+        if ! sudo tailscale up --ssh --authkey="$TS_KEY" 2>/dev/null; then
+            sudo tailscale up --authkey="$TS_KEY" 2>/dev/null || true
+        fi
         echo -e "${GREEN}connected (auth key)${NC}"
     else
         echo ""
         echo -e "  ${YELLOW}No auth key provided. Opening browser login...${NC}"
-        sudo tailscale up --ssh
+        sudo tailscale up --ssh 2>/dev/null || sudo tailscale up 2>/dev/null || true
         echo -e "  ${GREEN}Connected${NC}"
     fi
 fi
