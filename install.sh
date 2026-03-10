@@ -1,8 +1,19 @@
 #!/usr/bin/env bash
 # rtmux remote installer - Run on any PC to join your rtmux fleet
-# Usage: curl -sL https://raw.githubusercontent.com/adaptationio/tmux/main/install-remote.sh | bash
-# Auto:  curl -sL ... | bash -s -- --key tskey-auth-XXXXX --name laptop --manager adaptation
+# Usage: curl -sL https://raw.githubusercontent.com/adaptationio/rtmux-install/main/install.sh | bash
+# Auto:  curl -sL ... | bash -s -- --name laptop
 set -uo pipefail
+
+# ─── Elevate to root if not already ────────────────────────────────────────────
+if [[ "$(id -u)" -ne 0 ]]; then
+    echo -e "\033[0;31mThis installer needs root.\033[0m Run with:"
+    echo -e "  curl -sL https://raw.githubusercontent.com/adaptationio/rtmux-install/main/install.sh | sudo bash -s -- --name \$(hostname -s)"
+    exit 1
+fi
+
+# Capture the real user (not root) for SSH keys and tmux sessions
+REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
+REAL_HOME=$(eval echo "~$REAL_USER")
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
@@ -31,6 +42,7 @@ done
 echo -e "${BOLD}rtmux remote setup${NC}"
 echo -e "${DIM}─────────────────────────────────────────────────${NC}"
 echo -e "  No ports needed. No IP config. Tailscale handles everything."
+echo -e "  Running as root. Real user: ${BOLD}${REAL_USER}${NC}"
 echo ""
 
 # ─── Gather info ────────────────────────────────────────────────────────────────
@@ -47,11 +59,11 @@ echo ""
 echo -ne "${CYAN}[1/7]${NC} Installing dependencies... "
 install_pkg() {
     if command -v apt-get &>/dev/null; then
-        sudo apt-get update -qq && sudo apt-get install -y -qq "$@"
+        apt-get update -qq && apt-get install -y -qq "$@"
     elif command -v yum &>/dev/null; then
-        sudo yum install -y "$@"
+        yum install -y "$@"
     elif command -v pacman &>/dev/null; then
-        sudo pacman -S --noconfirm "$@"
+        pacman -S --noconfirm "$@"
     fi
 }
 
@@ -68,20 +80,23 @@ echo -ne "${CYAN}[2/7]${NC} SSH server... "
 if systemctl is-active --quiet sshd 2>/dev/null || systemctl is-active --quiet ssh 2>/dev/null; then
     echo -e "${GREEN}running${NC}"
 elif command -v sshd &>/dev/null; then
-    sudo systemctl enable --now ssh 2>/dev/null || sudo systemctl enable --now sshd 2>/dev/null || sudo service ssh start 2>/dev/null
+    systemctl enable --now ssh 2>/dev/null || systemctl enable --now sshd 2>/dev/null || service ssh start 2>/dev/null
     echo -e "${GREEN}started${NC}"
 else
     install_pkg openssh-server
-    sudo systemctl enable --now ssh 2>/dev/null || sudo service ssh start 2>/dev/null
+    systemctl enable --now ssh 2>/dev/null || service ssh start 2>/dev/null
     echo -e "${GREEN}installed and started${NC}"
 fi
 
-# ─── 3. SSH keys ───────────────────────────────────────────────────────────────
+# ─── 3. SSH keys (as real user) ───────────────────────────────────────────────
 
 echo -ne "${CYAN}[3/7]${NC} SSH keys... "
-SSH_KEY="$HOME/.ssh/id_ed25519"
-mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
-[[ -f "$SSH_KEY" ]] || ssh-keygen -t ed25519 -f "$SSH_KEY" -N "" -q
+SSH_DIR="$REAL_HOME/.ssh"
+SSH_KEY="$SSH_DIR/id_ed25519"
+su - "$REAL_USER" -c "mkdir -p '$SSH_DIR' && chmod 700 '$SSH_DIR'"
+if [[ ! -f "$SSH_KEY" ]]; then
+    su - "$REAL_USER" -c "ssh-keygen -t ed25519 -f '$SSH_KEY' -N '' -q"
+fi
 echo -e "${GREEN}ready${NC}"
 
 # ─── 4. Install Tailscale ──────────────────────────────────────────────────────
@@ -105,24 +120,34 @@ if [[ "$TS_STATUS" == "true" ]]; then
 else
     if [[ -n "$TS_KEY" ]]; then
         # Auto-authenticate with auth key — no browser needed
-        # Try with --ssh first, fall back without it
-        if ! sudo tailscale up --ssh --authkey="$TS_KEY" 2>/dev/null; then
-            sudo tailscale up --authkey="$TS_KEY" 2>/dev/null || true
-        fi
+        tailscale up --ssh --authkey="$TS_KEY" 2>/dev/null || tailscale up --authkey="$TS_KEY" 2>/dev/null || true
+        # Wait a moment for connection
+        sleep 3
         echo -e "${GREEN}connected (auth key)${NC}"
     else
         echo ""
         echo -e "  ${YELLOW}No auth key provided. Opening browser login...${NC}"
-        sudo tailscale up --ssh 2>/dev/null || sudo tailscale up 2>/dev/null || true
+        tailscale up --ssh 2>/dev/null || tailscale up 2>/dev/null || true
         echo -e "  ${GREEN}Connected${NC}"
     fi
 fi
 
-# Get Tailscale IP
-TS_IP=$(tailscale ip -4 2>/dev/null)
-echo -e "  Tailscale IP: ${BOLD}${TS_IP}${NC}"
+# Get Tailscale IP (retry a few times)
+TS_IP=""
+for i in 1 2 3 4 5; do
+    TS_IP=$(tailscale ip -4 2>/dev/null || echo "")
+    [[ -n "$TS_IP" ]] && break
+    sleep 2
+done
 
-# ─── 6. Find manager on Tailscale network ──────────────────────────────────────
+if [[ -z "$TS_IP" ]]; then
+    echo -e "  ${RED}Could not get Tailscale IP. Check 'tailscale status'${NC}"
+    echo -e "  ${YELLOW}Continuing with remaining setup...${NC}"
+else
+    echo -e "  Tailscale IP: ${BOLD}${TS_IP}${NC}"
+fi
+
+# ─── 6. Connect to manager ─────────────────────────────────────────────────────
 
 echo -ne "${CYAN}[6/7]${NC} Connecting to manager... "
 
@@ -131,36 +156,37 @@ MANAGER_PORT=22
 
 echo -e "${GREEN}${MANAGER}${NC}"
 
-# ─── Exchange SSH keys via Tailscale ────────────────────────────────────────────
+# ─── Exchange SSH keys via Tailscale (as real user) ─────────────────────────────
 
-echo -e "  ${DIM}Setting up SSH key exchange (may ask for password once)...${NC}"
+echo -e "  ${DIM}Setting up SSH key exchange...${NC}"
 
 # Our key -> manager
-ssh-copy-id -i "${SSH_KEY}.pub" -p "$MANAGER_PORT" -o ConnectTimeout=10 "$MANAGER" 2>/dev/null || {
+su - "$REAL_USER" -c "ssh-copy-id -i '${SSH_KEY}.pub' -p $MANAGER_PORT -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new '$MANAGER'" 2>/dev/null || {
     echo -e "  ${YELLOW}Auto key copy failed. You can add manually later.${NC}"
 }
 
 # Manager's key -> us
-MANAGER_KEY=$(ssh -p "$MANAGER_PORT" -o ConnectTimeout=10 "$MANAGER" "cat ~/.ssh/id_ed25519.pub 2>/dev/null || cat ~/.ssh/id_rsa.pub 2>/dev/null" 2>/dev/null || echo "")
+MANAGER_KEY=$(su - "$REAL_USER" -c "ssh -p $MANAGER_PORT -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new '$MANAGER' 'cat ~/.ssh/id_ed25519.pub 2>/dev/null || cat ~/.ssh/id_rsa.pub 2>/dev/null'" 2>/dev/null || echo "")
 if [[ -n "$MANAGER_KEY" ]]; then
-    touch "$HOME/.ssh/authorized_keys" && chmod 600 "$HOME/.ssh/authorized_keys"
-    grep -qF "$MANAGER_KEY" "$HOME/.ssh/authorized_keys" 2>/dev/null || echo "$MANAGER_KEY" >> "$HOME/.ssh/authorized_keys"
+    AUTH_KEYS="$SSH_DIR/authorized_keys"
+    touch "$AUTH_KEYS" && chmod 600 "$AUTH_KEYS" && chown "$REAL_USER:$REAL_USER" "$AUTH_KEYS"
+    grep -qF "$MANAGER_KEY" "$AUTH_KEYS" 2>/dev/null || echo "$MANAGER_KEY" >> "$AUTH_KEYS"
     echo -e "  ${GREEN}Keys exchanged${NC}"
 else
-    echo -e "  ${YELLOW}Couldn't get manager key. Run from manager: ssh-copy-id $(whoami)@${TS_IP}${NC}"
+    echo -e "  ${YELLOW}Couldn't get manager key. Run from manager: ssh-copy-id ${REAL_USER}@${TS_IP}${NC}"
 fi
 
 # ─── 7. Register + Install Agent ───────────────────────────────────────────────
 
 echo -ne "${CYAN}[7/7]${NC} Registering with manager... "
 
-THIS_USER=$(whoami)
+THIS_USER="$REAL_USER"
 THIS_PORT=22
-REGISTER_IP="$TS_IP"
+REGISTER_IP="${TS_IP:-unknown}"
 
 REGISTER_CMD="mkdir -p \$HOME/.config/rtmux; F=\$HOME/.config/rtmux/hosts.json; [ -f \"\$F\" ] || echo '{\"hosts\":{}}' > \"\$F\"; T=\$(mktemp); jq --arg a \"$ALIAS\" --arg h \"$REGISTER_IP\" --arg u \"$THIS_USER\" --arg p \"$THIS_PORT\" '.hosts[\$a]={host:\$h,user:\$u,port:(\$p|tonumber),identity:\"\"}' \"\$F\" > \"\$T\" && mv \"\$T\" \"\$F\" && echo ok"
 
-result=$(ssh -p "$MANAGER_PORT" -o ConnectTimeout=10 "$MANAGER" "$REGISTER_CMD" 2>/dev/null) || true
+result=$(su - "$REAL_USER" -c "ssh -p $MANAGER_PORT -o ConnectTimeout=10 '$MANAGER' \"$REGISTER_CMD\"" 2>/dev/null) || true
 
 if [[ "$result" == *"ok"* ]]; then
     echo -e "${GREEN}registered!${NC}"
@@ -173,10 +199,10 @@ fi
 
 echo -ne "  Installing agent service... "
 
-sudo mkdir -p /opt/rtmux /etc/rtmux
+mkdir -p /opt/rtmux /etc/rtmux
 
 # Agent daemon
-sudo tee /opt/rtmux/agent.sh > /dev/null <<'AGENTEOF'
+tee /opt/rtmux/agent.sh > /dev/null <<'AGENTEOF'
 #!/usr/bin/env bash
 CONFIG_DIR="/etc/rtmux"
 SESSIONS_FILE="$CONFIG_DIR/sessions.json"
@@ -209,10 +235,10 @@ while true; do
     ensure_sessions
 done
 AGENTEOF
-sudo chmod +x /opt/rtmux/agent.sh
+chmod +x /opt/rtmux/agent.sh
 
 # Control script
-sudo tee /opt/rtmux/ctl.sh > /dev/null <<'CTLEOF'
+tee /opt/rtmux/ctl.sh > /dev/null <<'CTLEOF'
 #!/usr/bin/env bash
 CONFIG_DIR="/etc/rtmux"
 SESSIONS_FILE="$CONFIG_DIR/sessions.json"
@@ -223,13 +249,13 @@ case "${1:-}" in
     add)
         [[ -z "${2:-}" ]] && { echo "Usage: rtmux-ctl add <session>"; exit 1; }
         TMP=$(mktemp)
-        jq --arg s "$2" '.sessions += [$s] | .sessions |= unique' "$SESSIONS_FILE" > "$TMP" && sudo mv "$TMP" "$SESSIONS_FILE"
+        jq --arg s "$2" '.sessions += [$s] | .sessions |= unique' "$SESSIONS_FILE" > "$TMP" && mv "$TMP" "$SESSIONS_FILE"
         echo "Added '$2' - agent will create it within 60s"
         ;;
     remove)
         [[ -z "${2:-}" ]] && { echo "Usage: rtmux-ctl remove <session>"; exit 1; }
         TMP=$(mktemp)
-        jq --arg s "$2" '.sessions -= [$s]' "$SESSIONS_FILE" > "$TMP" && sudo mv "$TMP" "$SESSIONS_FILE"
+        jq --arg s "$2" '.sessions -= [$s]' "$SESSIONS_FILE" > "$TMP" && mv "$TMP" "$SESSIONS_FILE"
         echo "Removed '$2'"
         ;;
     list)
@@ -252,11 +278,11 @@ case "${1:-}" in
         ;;
 esac
 CTLEOF
-sudo chmod +x /opt/rtmux/ctl.sh
-sudo ln -sf /opt/rtmux/ctl.sh /usr/local/bin/rtmux-ctl 2>/dev/null || true
+chmod +x /opt/rtmux/ctl.sh
+ln -sf /opt/rtmux/ctl.sh /usr/local/bin/rtmux-ctl 2>/dev/null || true
 
-# Systemd service
-sudo tee /etc/systemd/system/rtmux-agent.service > /dev/null <<SVCEOF
+# Systemd service (runs as real user, not root)
+tee /etc/systemd/system/rtmux-agent.service > /dev/null <<SVCEOF
 [Unit]
 Description=rtmux persistent session agent
 After=network-online.target tailscaled.service
@@ -267,22 +293,22 @@ Type=simple
 ExecStart=/opt/rtmux/agent.sh
 Restart=always
 RestartSec=5
-User=$(whoami)
-Environment=HOME=$HOME
+User=${REAL_USER}
+Environment=HOME=${REAL_HOME}
 Environment=RTMUX_HEARTBEAT=60
 
 [Install]
 WantedBy=multi-user.target
 SVCEOF
 
-sudo systemctl daemon-reload
-sudo systemctl enable rtmux-agent
-sudo systemctl start rtmux-agent
+systemctl daemon-reload
+systemctl enable rtmux-agent
+systemctl start rtmux-agent
 
 echo -e "${GREEN}done${NC}"
 
-# Create initial session
-tmux has-session -t main 2>/dev/null || tmux new-session -d -s main
+# Create initial session as real user
+su - "$REAL_USER" -c "tmux has-session -t main 2>/dev/null || tmux new-session -d -s main"
 
 # ─── Done ───────────────────────────────────────────────────────────────────────
 
@@ -292,7 +318,7 @@ echo -e "${BOLD}║  ${GREEN}Setup complete!${NC}${BOLD}                        
 echo -e "${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "  ${BOLD}This PC:${NC} ${ALIAS}"
-echo -e "  ${BOLD}Tailscale IP:${NC} ${TS_IP}"
+echo -e "  ${BOLD}Tailscale IP:${NC} ${TS_IP:-pending}"
 echo -e "  ${BOLD}Manager:${NC} ${MANAGER}"
 echo ""
 echo -e "  ${GREEN}●${NC} Tailscale connected (zero-config networking)"
