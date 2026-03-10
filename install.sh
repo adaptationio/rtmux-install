@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # rtmux remote installer - Run on any PC to join your rtmux fleet
-# Usage: curl -sL https://raw.githubusercontent.com/adaptationio/rtmux-install/main/install.sh | sudo bash -s -- --key YOUR_TS_KEY --name laptop
+# Usage: curl -sL https://raw.githubusercontent.com/adaptationio/rtmux-install/main/install.sh | sudo bash -s -- --key YOUR_TS_KEY --name mypc
 set -uo pipefail
 
 # ─── Elevate to root if not already ────────────────────────────────────────────
 if [[ "$(id -u)" -ne 0 ]]; then
     echo -e "\033[0;31mThis installer needs root.\033[0m Run with:"
-    echo -e "  curl -sL https://raw.githubusercontent.com/adaptationio/rtmux-install/main/install.sh | sudo bash -s -- --name \$(hostname -s)"
+    echo -e "  curl -sL https://raw.githubusercontent.com/adaptationio/rtmux-install/main/install.sh | sudo bash -s -- --key YOUR_KEY --name \$(hostname -s)"
     exit 1
 fi
 
@@ -17,7 +17,7 @@ REAL_HOME=$(eval echo "~$REAL_USER")
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 
-# ─── Pre-configured defaults (edit these for your fleet) ────────────────────────
+# ─── Pre-configured defaults ─────────────────────────────────────────────────
 DEFAULT_TS_KEY=""  # Pass via --key flag (never commit keys to public repos)
 DEFAULT_MANAGER_HOST="godv2"       # Tailscale hostname of manager
 DEFAULT_MANAGER_USER="adaptation"  # SSH user on manager
@@ -118,9 +118,7 @@ if [[ "$TS_STATUS" == "true" ]]; then
     echo -e "${GREEN}already connected${NC}"
 else
     if [[ -n "$TS_KEY" ]]; then
-        # Auto-authenticate with auth key — no browser needed
         tailscale up --ssh --authkey="$TS_KEY" 2>/dev/null || tailscale up --authkey="$TS_KEY" 2>/dev/null || true
-        # Wait a moment for connection
         sleep 3
         echo -e "${GREEN}connected (auth key)${NC}"
     else
@@ -146,52 +144,61 @@ else
     echo -e "  Tailscale IP: ${BOLD}${TS_IP}${NC}"
 fi
 
-# ─── 6. Connect to manager ─────────────────────────────────────────────────────
+# ─── 6. Connect to manager (non-interactive via Tailscale SSH) ────────────────
 
 echo -ne "${CYAN}[6/7]${NC} Connecting to manager... "
 
 MANAGER="${MANAGER_USER}@${MANAGER_HOST}"
 MANAGER_PORT=22
+SSH_OPTS="-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -o BatchMode=yes"
 
 echo -e "${GREEN}${MANAGER}${NC}"
 
-# ─── Exchange SSH keys via Tailscale (as real user) ─────────────────────────────
+# Tailscale SSH gives us passwordless access. Use it to:
+# 1. Push our public key to the manager's authorized_keys
+# 2. Pull the manager's public key to our authorized_keys
+# 3. Register ourselves in the manager's rtmux hosts.json
 
-echo -e "  ${DIM}Setting up SSH key exchange...${NC}"
+echo -e "  ${DIM}Exchanging SSH keys (via Tailscale SSH)...${NC}"
 
-# Our key -> manager
-su - "$REAL_USER" -c "ssh-copy-id -i '${SSH_KEY}.pub' -p $MANAGER_PORT -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new '$MANAGER'" 2>/dev/null || {
-    echo -e "  ${YELLOW}Auto key copy failed. You can add manually later.${NC}"
-}
+OUR_PUBKEY=$(cat "${SSH_KEY}.pub" 2>/dev/null)
+THIS_USER="$REAL_USER"
+THIS_PORT=22
+REGISTER_IP="${TS_IP:-unknown}"
 
-# Manager's key -> us
-MANAGER_KEY=$(su - "$REAL_USER" -c "ssh -p $MANAGER_PORT -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new '$MANAGER' 'cat ~/.ssh/id_ed25519.pub 2>/dev/null || cat ~/.ssh/id_rsa.pub 2>/dev/null'" 2>/dev/null || echo "")
+# Try to connect to manager - Tailscale SSH should work without password
+MANAGER_KEY=$(su - "$REAL_USER" -c "ssh $SSH_OPTS -p $MANAGER_PORT '$MANAGER' 'cat ~/.ssh/id_ed25519.pub 2>/dev/null || cat ~/.ssh/id_rsa.pub 2>/dev/null'" 2>/dev/null || echo "")
+
 if [[ -n "$MANAGER_KEY" ]]; then
+    # Add manager's key to our authorized_keys
     AUTH_KEYS="$SSH_DIR/authorized_keys"
     touch "$AUTH_KEYS" && chmod 600 "$AUTH_KEYS" && chown "$REAL_USER:$REAL_USER" "$AUTH_KEYS"
     grep -qF "$MANAGER_KEY" "$AUTH_KEYS" 2>/dev/null || echo "$MANAGER_KEY" >> "$AUTH_KEYS"
+
+    # Push our key to manager's authorized_keys
+    su - "$REAL_USER" -c "ssh $SSH_OPTS -p $MANAGER_PORT '$MANAGER' 'grep -qF \"$OUR_PUBKEY\" ~/.ssh/authorized_keys 2>/dev/null || echo \"$OUR_PUBKEY\" >> ~/.ssh/authorized_keys'" 2>/dev/null || true
+
     echo -e "  ${GREEN}Keys exchanged${NC}"
 else
-    echo -e "  ${YELLOW}Couldn't get manager key. Run from manager: ssh-copy-id ${REAL_USER}@${TS_IP}${NC}"
+    echo -e "  ${YELLOW}Couldn't reach manager via Tailscale SSH.${NC}"
+    echo -e "  ${DIM}Run on manager: ssh-copy-id ${THIS_USER}@${TS_IP}${NC}"
+    echo -e "  ${DIM}Then: rtmux add-host ${ALIAS} ${REGISTER_IP} ${THIS_USER} ${THIS_PORT}${NC}"
 fi
 
 # ─── 7. Register + Install Agent ───────────────────────────────────────────────
 
 echo -ne "${CYAN}[7/7]${NC} Registering with manager... "
 
-THIS_USER="$REAL_USER"
-THIS_PORT=22
-REGISTER_IP="${TS_IP:-unknown}"
-
+# Register this PC in the manager's rtmux hosts.json with CORRECT username and IP
 REGISTER_CMD="mkdir -p \$HOME/.config/rtmux; F=\$HOME/.config/rtmux/hosts.json; [ -f \"\$F\" ] || echo '{\"hosts\":{}}' > \"\$F\"; T=\$(mktemp); jq --arg a \"$ALIAS\" --arg h \"$REGISTER_IP\" --arg u \"$THIS_USER\" --arg p \"$THIS_PORT\" '.hosts[\$a]={host:\$h,user:\$u,port:(\$p|tonumber),identity:\"\"}' \"\$F\" > \"\$T\" && mv \"\$T\" \"\$F\" && echo ok"
 
-result=$(su - "$REAL_USER" -c "ssh -p $MANAGER_PORT -o ConnectTimeout=10 '$MANAGER' \"$REGISTER_CMD\"" 2>/dev/null) || true
+result=$(su - "$REAL_USER" -c "ssh $SSH_OPTS -p $MANAGER_PORT '$MANAGER' \"$REGISTER_CMD\"" 2>/dev/null) || true
 
 if [[ "$result" == *"ok"* ]]; then
-    echo -e "${GREEN}registered!${NC}"
+    echo -e "${GREEN}registered as '${ALIAS}' (user: ${THIS_USER}, ip: ${REGISTER_IP})${NC}"
 else
     echo -e "${YELLOW}auto-register failed${NC}"
-    echo -e "  Run on manager: ${CYAN}rtmux add-host ${ALIAS} ${REGISTER_IP} ${THIS_USER} ${THIS_PORT}${NC}"
+    echo -e "  ${DIM}Run on manager:${NC} ${CYAN}rtmux add-host ${ALIAS} ${REGISTER_IP} ${THIS_USER} ${THIS_PORT}${NC}"
 fi
 
 # ─── Install rtmux-agent service ────────────────────────────────────────────────
@@ -309,6 +316,11 @@ echo -e "${GREEN}done${NC}"
 # Create initial session as real user
 su - "$REAL_USER" -c "tmux has-session -t main 2>/dev/null || tmux new-session -d -s main"
 
+# ─── Disable Tailscale key expiry via API if possible ─────────────────────────
+
+# Try to have the manager disable key expiry for this device
+su - "$REAL_USER" -c "ssh $SSH_OPTS -p $MANAGER_PORT '$MANAGER' 'bash ~/.config/rtmux/ts-renew.sh 2>/dev/null || true'" 2>/dev/null &
+
 # ─── Done ───────────────────────────────────────────────────────────────────────
 
 echo ""
@@ -317,6 +329,7 @@ echo -e "${BOLD}║  ${GREEN}Setup complete!${NC}${BOLD}                        
 echo -e "${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "  ${BOLD}This PC:${NC} ${ALIAS}"
+echo -e "  ${BOLD}User:${NC} ${REAL_USER}"
 echo -e "  ${BOLD}Tailscale IP:${NC} ${TS_IP:-pending}"
 echo -e "  ${BOLD}Manager:${NC} ${MANAGER}"
 echo ""
@@ -324,6 +337,7 @@ echo -e "  ${GREEN}●${NC} Tailscale connected (zero-config networking)"
 echo -e "  ${GREEN}●${NC} rtmux-agent running (auto-start, auto-restart)"
 echo -e "  ${GREEN}●${NC} tmux session 'main' active (recreates if killed)"
 echo -e "  ${GREEN}●${NC} SSH keys exchanged"
+echo -e "  ${GREEN}●${NC} Registered as: ${CYAN}${ALIAS}${NC} (user: ${THIS_USER}, ip: ${REGISTER_IP})"
 echo ""
 echo -e "  ${BOLD}On your manager PC, run:${NC}"
 echo -e "    ${CYAN}rtmux ls ${ALIAS}${NC}"
