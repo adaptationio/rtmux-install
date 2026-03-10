@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # rtmux remote installer - Run on any PC to join your rtmux fleet
-# Usage: curl -sL https://raw.githubusercontent.com/adaptationio/rtmux-install/main/install.sh | bash
-# Auto:  curl -sL ... | bash -s -- --name laptop
+# Usage: curl -sL https://raw.githubusercontent.com/adaptationio/rtmux-install/main/install.sh | sudo bash -s -- --key YOUR_TS_KEY --name laptop
 set -uo pipefail
 
 # ─── Elevate to root if not already ────────────────────────────────────────────
@@ -19,7 +18,7 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 
 # ─── Pre-configured defaults (edit these for your fleet) ────────────────────────
-DEFAULT_TS_KEY="tskey-auth-kpW4hyeRSo11CNTRL-Wd61wKwypxHuAWRnhe2wxHNrHvHCjCpR"
+DEFAULT_TS_KEY=""  # Pass via --key flag (never commit keys to public repos)
 DEFAULT_MANAGER_HOST="godv2"       # Tailscale hostname of manager
 DEFAULT_MANAGER_USER="adaptation"  # SSH user on manager
 
