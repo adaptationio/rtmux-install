@@ -324,11 +324,20 @@ su - "$REAL_USER" -c "tmux has-session -t main 2>/dev/null || tmux new-session -
 # ─── 8. Install Node.js (for CSM agent) ──────────────────────────────────────
 
 echo -ne "${CYAN}[8/9]${NC} Node.js... "
+NEED_NODE=false
 if command -v node &>/dev/null; then
-    NODE_VER=$(node --version 2>/dev/null)
-    echo -e "${GREEN}${NODE_VER} already installed${NC}"
+    NODE_MAJOR=$(node --version 2>/dev/null | sed 's/v\([0-9]*\).*/\1/')
+    if [[ "$NODE_MAJOR" -lt 18 ]]; then
+        echo -ne "${YELLOW}v${NODE_MAJOR} too old, upgrading to v20... ${NC}"
+        NEED_NODE=true
+    else
+        echo -e "${GREEN}$(node --version) ok${NC}"
+    fi
 else
-    echo -ne "${YELLOW}installing... ${NC}"
+    echo -ne "${YELLOW}installing v20... ${NC}"
+    NEED_NODE=true
+fi
+if [[ "$NEED_NODE" == "true" ]]; then
     if command -v apt-get &>/dev/null; then
         curl -fsSL https://deb.nodesource.com/setup_20.x 2>/dev/null | bash - &>/dev/null
         apt-get install -y -qq nodejs &>/dev/null
@@ -336,7 +345,7 @@ else
         curl -fsSL https://rpm.nodesource.com/setup_20.x 2>/dev/null | bash - &>/dev/null
         yum install -y nodejs &>/dev/null
     fi
-    echo -e "${GREEN}$(node --version 2>/dev/null || echo 'done')${NC}"
+    echo -e "${GREEN}$(node --version 2>/dev/null || echo 'installed')${NC}"
 fi
 
 # ─── 9. Install CSM Hub Agent ────────────────────────────────────────────────
