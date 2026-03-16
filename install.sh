@@ -10,6 +10,8 @@
 #   --hub-ip IP        Hub server IP (Tailscale IP of GODv2)
 #   --hub-token TOKEN  Auth token for hub API
 #   --hub-port PORT    Hub port (default: 7780)
+#   --manager-key KEY  SSH public key of the manager (enables remote tmux attach)
+#   --ssh-port PORT    Extra sshd port for remote access (default: 2222)
 #   --key TSKEY        Tailscale auth key (optional, for headless join)
 #   --skip-tailscale   Skip Tailscale install (if already on same network)
 #   --user USER        Run agent as this user (default: SUDO_USER)
@@ -36,6 +38,8 @@ HUB_PORT="7780"
 TS_KEY=""
 SKIP_TS=false
 AGENT_USER=""
+MANAGER_KEY=""
+SSH_PORT="2222"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -46,6 +50,8 @@ while [[ $# -gt 0 ]]; do
         --key)            TS_KEY="$2"; shift 2 ;;
         --skip-tailscale) SKIP_TS=true; shift ;;
         --user)           AGENT_USER="$2"; shift 2 ;;
+        --manager-key)    MANAGER_KEY="$2"; shift 2 ;;
+        --ssh-port)       SSH_PORT="$2"; shift 2 ;;
         *)                shift ;;
     esac
 done
@@ -81,7 +87,7 @@ ok() { echo -e "${GREEN}$1${NC}"; }
 warn() { echo -e "${YELLOW}$1${NC}"; }
 fail() { echo -e "${RED}$1${NC}"; ERRORS+=("$2"); }
 
-TOTAL=6
+TOTAL=7
 
 # ─── 1. Install system deps ─────────────────────────────────────────────────
 step 1 "System dependencies..."
@@ -328,6 +334,57 @@ SVCEOF
     fi
 fi
 
+# ─── 7. SSH remote access (for tmux attach from manager) ─────────────────────
+step 7 "Remote SSH access..."
+
+# Add an extra sshd port that bypasses Tailscale SSH interception
+SSHD_CONF="/etc/ssh/sshd_config"
+if grep -q "^Port ${SSH_PORT}" "$SSHD_CONF" 2>/dev/null; then
+    echo -ne "port ${SSH_PORT} already configured, "
+else
+    echo -e "\n# CSM remote access port (bypasses Tailscale SSH)\nPort ${SSH_PORT}" >> "$SSHD_CONF"
+    # Allow through firewall
+    ufw allow "${SSH_PORT}/tcp" 2>/dev/null || true
+    systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+    echo -ne "port ${SSH_PORT} added, "
+fi
+
+# Add manager's SSH key if provided
+if [[ -n "$MANAGER_KEY" ]]; then
+    AUTH_KEYS="$REAL_HOME/.ssh/authorized_keys"
+    mkdir -p "$REAL_HOME/.ssh" && chmod 700 "$REAL_HOME/.ssh"
+    touch "$AUTH_KEYS" && chmod 600 "$AUTH_KEYS"
+    chown -R "$REAL_USER:$(id -gn "$REAL_USER" 2>/dev/null || echo "$REAL_USER")" "$REAL_HOME/.ssh"
+    if grep -qF "$MANAGER_KEY" "$AUTH_KEYS" 2>/dev/null; then
+        ok "key already present"
+    else
+        echo "$MANAGER_KEY" >> "$AUTH_KEYS"
+        ok "manager key added"
+    fi
+else
+    # Auto-fetch manager's key from hub if reachable
+    if [[ -n "$HUB_IP" ]]; then
+        FETCHED_KEY=$(curl -sf "http://${HUB_IP}:${HUB_PORT}/api/v1/manager-key" 2>/dev/null || echo "")
+        if [[ -n "$FETCHED_KEY" && "$FETCHED_KEY" == ssh-* ]]; then
+            AUTH_KEYS="$REAL_HOME/.ssh/authorized_keys"
+            mkdir -p "$REAL_HOME/.ssh" && chmod 700 "$REAL_HOME/.ssh"
+            touch "$AUTH_KEYS" && chmod 600 "$AUTH_KEYS"
+            chown -R "$REAL_USER:$(id -gn "$REAL_USER" 2>/dev/null || echo "$REAL_USER")" "$REAL_HOME/.ssh"
+            grep -qF "$FETCHED_KEY" "$AUTH_KEYS" 2>/dev/null || echo "$FETCHED_KEY" >> "$AUTH_KEYS"
+            ok "manager key fetched from hub"
+        else
+            warn "no --manager-key (pass manager's SSH public key for remote tmux attach)"
+        fi
+    else
+        warn "skipped (no --manager-key or --hub-ip)"
+    fi
+fi
+
+# Verify sshd on the extra port
+if ss -tlnp 2>/dev/null | grep -q ":${SSH_PORT} " 2>/dev/null; then
+    echo -e "  ${DIM}Remote tmux attach: ssh -p ${SSH_PORT} ${REAL_USER}@\$(tailscale ip -4 2>/dev/null || hostname -I | awk '{print \$1}') -t 'tmux attach'${NC}"
+fi
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}════════════════════════════════════════════════════${NC}"
@@ -356,6 +413,8 @@ echo ""
 echo -e "  ${BOLD}Services:${NC}"
 systemctl is-active --quiet rtmux-agent 2>/dev/null && echo -e "    ${GREEN}●${NC} rtmux-agent  (tmux session keepalive)" || echo -e "    ${RED}○${NC} rtmux-agent"
 systemctl is-active --quiet csm-agent 2>/dev/null && echo -e "    ${GREEN}●${NC} csm-agent    (hub connection + metrics)" || echo -e "    ${RED}○${NC} csm-agent"
+
+echo -e "  ${BOLD}SSH Port:${NC}   ${SSH_PORT} (for remote tmux attach)"
 
 echo ""
 echo -e "  ${BOLD}Commands:${NC}"
