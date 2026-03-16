@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # rtmux remote installer - Run on any PC to join your rtmux fleet
-# Usage: curl -sL https://raw.githubusercontent.com/adaptationio/rtmux-install/main/install.sh | sudo bash -s -- --key YOUR_TS_KEY --name mypc
+# Usage: curl -sL https://raw.githubusercontent.com/adaptationio/rtmux-install/main/install.sh | sudo bash -s -- --name mypc
+# Flags: --key TAILSCALE_KEY  --name HOSTNAME  --hub-token CSM_TOKEN  --hub-port 7780
 set -uo pipefail
 
 # ─── Elevate to root if not already ────────────────────────────────────────────
@@ -27,14 +28,18 @@ TS_KEY="${DEFAULT_TS_KEY}"
 ALIAS=""
 MANAGER_USER="${DEFAULT_MANAGER_USER}"
 MANAGER_HOST="${DEFAULT_MANAGER_HOST}"
+HUB_TOKEN=""
+HUB_PORT="7780"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --key)      TS_KEY="$2"; shift 2 ;;
-        --name)     ALIAS="$2"; shift 2 ;;
-        --manager)  MANAGER_USER="$2"; shift 2 ;;
-        --host)     MANAGER_HOST="$2"; shift 2 ;;
-        *)          shift ;;
+        --key)        TS_KEY="$2"; shift 2 ;;
+        --name)       ALIAS="$2"; shift 2 ;;
+        --manager)    MANAGER_USER="$2"; shift 2 ;;
+        --host)       MANAGER_HOST="$2"; shift 2 ;;
+        --hub-token)  HUB_TOKEN="$2"; shift 2 ;;
+        --hub-port)   HUB_PORT="$2"; shift 2 ;;
+        *)            shift ;;
     esac
 done
 
@@ -55,7 +60,7 @@ ALIAS="${ALIAS:-$default_alias}"
 # ─── 1. Install dependencies ───────────────────────────────────────────────────
 
 echo ""
-echo -ne "${CYAN}[1/7]${NC} Installing dependencies... "
+echo -ne "${CYAN}[1/9]${NC} Installing dependencies... "
 install_pkg() {
     if command -v apt-get &>/dev/null; then
         apt-get update -qq && apt-get install -y -qq "$@"
@@ -75,7 +80,7 @@ echo -e "${GREEN}done${NC}"
 
 # ─── 2. SSH server ─────────────────────────────────────────────────────────────
 
-echo -ne "${CYAN}[2/7]${NC} SSH server... "
+echo -ne "${CYAN}[2/9]${NC} SSH server... "
 if systemctl is-active --quiet sshd 2>/dev/null || systemctl is-active --quiet ssh 2>/dev/null; then
     echo -e "${GREEN}running${NC}"
 elif command -v sshd &>/dev/null; then
@@ -89,7 +94,7 @@ fi
 
 # ─── 3. SSH keys (as real user) ───────────────────────────────────────────────
 
-echo -ne "${CYAN}[3/7]${NC} SSH keys... "
+echo -ne "${CYAN}[3/9]${NC} SSH keys... "
 SSH_DIR="$REAL_HOME/.ssh"
 SSH_KEY="$SSH_DIR/id_ed25519"
 su - "$REAL_USER" -c "mkdir -p '$SSH_DIR' && chmod 700 '$SSH_DIR'"
@@ -100,7 +105,7 @@ echo -e "${GREEN}ready${NC}"
 
 # ─── 4. Install Tailscale ──────────────────────────────────────────────────────
 
-echo -ne "${CYAN}[4/7]${NC} Tailscale... "
+echo -ne "${CYAN}[4/9]${NC} Tailscale... "
 if command -v tailscale &>/dev/null; then
     echo -e "${GREEN}already installed${NC}"
 else
@@ -111,7 +116,7 @@ fi
 
 # ─── 5. Connect to Tailscale ───────────────────────────────────────────────────
 
-echo -ne "${CYAN}[5/7]${NC} Connecting to Tailscale... "
+echo -ne "${CYAN}[5/9]${NC} Connecting to Tailscale... "
 TS_STATUS=$(tailscale status --json 2>/dev/null | jq -r '.Self.Online // false' 2>/dev/null || echo "false")
 
 if [[ "$TS_STATUS" == "true" ]]; then
@@ -146,7 +151,7 @@ fi
 
 # ─── 6. Connect to manager (non-interactive via Tailscale SSH) ────────────────
 
-echo -ne "${CYAN}[6/7]${NC} Connecting to manager... "
+echo -ne "${CYAN}[6/9]${NC} Connecting to manager... "
 
 MANAGER="${MANAGER_USER}@${MANAGER_HOST}"
 MANAGER_PORT=22
@@ -187,7 +192,7 @@ fi
 
 # ─── 7. Register + Install Agent ───────────────────────────────────────────────
 
-echo -ne "${CYAN}[7/7]${NC} Registering with manager... "
+echo -ne "${CYAN}[7/9]${NC} Registering with manager... "
 
 # Register this PC in the manager's rtmux hosts.json with CORRECT username and IP
 REGISTER_CMD="mkdir -p \$HOME/.config/rtmux; F=\$HOME/.config/rtmux/hosts.json; [ -f \"\$F\" ] || echo '{\"hosts\":{}}' > \"\$F\"; T=\$(mktemp); jq --arg a \"$ALIAS\" --arg h \"$REGISTER_IP\" --arg u \"$THIS_USER\" --arg p \"$THIS_PORT\" '.hosts[\$a]={host:\$h,user:\$u,port:(\$p|tonumber),identity:\"\"}' \"\$F\" > \"\$T\" && mv \"\$T\" \"\$F\" && echo ok"
@@ -316,6 +321,88 @@ echo -e "${GREEN}done${NC}"
 # Create initial session as real user
 su - "$REAL_USER" -c "tmux has-session -t main 2>/dev/null || tmux new-session -d -s main"
 
+# ─── 8. Install Node.js (for CSM agent) ──────────────────────────────────────
+
+echo -ne "${CYAN}[8/9]${NC} Node.js... "
+if command -v node &>/dev/null; then
+    NODE_VER=$(node --version 2>/dev/null)
+    echo -e "${GREEN}${NODE_VER} already installed${NC}"
+else
+    echo -ne "${YELLOW}installing... ${NC}"
+    if command -v apt-get &>/dev/null; then
+        curl -fsSL https://deb.nodesource.com/setup_20.x 2>/dev/null | bash - &>/dev/null
+        apt-get install -y -qq nodejs &>/dev/null
+    elif command -v yum &>/dev/null; then
+        curl -fsSL https://rpm.nodesource.com/setup_20.x 2>/dev/null | bash - &>/dev/null
+        yum install -y nodejs &>/dev/null
+    fi
+    echo -e "${GREEN}$(node --version 2>/dev/null || echo 'done')${NC}"
+fi
+
+# ─── 9. Install CSM Hub Agent ────────────────────────────────────────────────
+
+echo -ne "${CYAN}[9/9]${NC} CSM hub agent... "
+
+MANAGER_TS_IP=$(tailscale status --json 2>/dev/null | jq -r ".Peer[] | select(.HostName==\"${MANAGER_HOST}\") | .TailscaleIPs[0]" 2>/dev/null || echo "")
+[[ -z "$MANAGER_TS_IP" ]] && MANAGER_TS_IP=$(getent hosts "$MANAGER_HOST" 2>/dev/null | awk '{print $1}' || echo "")
+
+if [[ -z "$MANAGER_TS_IP" ]]; then
+    echo -e "${YELLOW}skipped (cannot resolve manager IP — pass --host MANAGER_HOSTNAME)${NC}"
+else
+    if [[ -z "$HUB_TOKEN" ]]; then
+        HUB_TOKEN=$(su - "$REAL_USER" -c "ssh $SSH_OPTS -p $MANAGER_PORT '$MANAGER' 'echo \$CSM_AUTH_TOKEN'" 2>/dev/null || echo "")
+    fi
+
+    if [[ -z "$HUB_TOKEN" ]]; then
+        echo -e "${YELLOW}skipped (no hub token — pass --hub-token TOKEN)${NC}"
+    else
+        CSM_AGENT_DIR="/opt/csm-agent"
+        mkdir -p "$CSM_AGENT_DIR"
+
+        curl -fsSL "https://raw.githubusercontent.com/adaptationio/rtmux-install/main/csm-agent.js" \
+            -o "$CSM_AGENT_DIR/agent.js" 2>/dev/null
+
+        cd "$CSM_AGENT_DIR"
+        [[ -f package.json ]] || node -e "require('fs').writeFileSync('package.json','{\"name\":\"csm-agent\",\"private\":true}')"
+        npm install --save ws &>/dev/null 2>&1
+
+        # Secrets go in env file with strict permissions — NOT in the service file
+        tee /etc/csm-agent.env > /dev/null <<ENVEOF
+CSM_HUB_URL=ws://${MANAGER_TS_IP}:${HUB_PORT}/ws/node
+CSM_AUTH_TOKEN=${HUB_TOKEN}
+CSM_HOSTNAME=${ALIAS}
+ENVEOF
+        chmod 600 /etc/csm-agent.env
+        chown root:root /etc/csm-agent.env
+
+        tee /etc/systemd/system/csm-agent.service > /dev/null <<SVCEOF
+[Unit]
+Description=CSM Hub Node Agent
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node /opt/csm-agent/agent.js
+EnvironmentFile=/etc/csm-agent.env
+Restart=always
+RestartSec=10
+User=${REAL_USER}
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+        systemctl daemon-reload
+        systemctl enable csm-agent
+        systemctl start csm-agent
+
+        echo -e "${GREEN}installed and running${NC}"
+        echo -e "  ${DIM}Hub: ws://${MANAGER_TS_IP}:${HUB_PORT}${NC}"
+        echo -e "  ${DIM}Config: /etc/csm-agent.env (root-only, chmod 600)${NC}"
+    fi
+fi
+
 # ─── Disable Tailscale key expiry via API if possible ─────────────────────────
 
 # Try to have the manager disable key expiry for this device
@@ -338,11 +425,18 @@ echo -e "  ${GREEN}●${NC} rtmux-agent running (auto-start, auto-restart)"
 echo -e "  ${GREEN}●${NC} tmux session 'main' active (recreates if killed)"
 echo -e "  ${GREEN}●${NC} SSH keys exchanged"
 echo -e "  ${GREEN}●${NC} Registered as: ${CYAN}${ALIAS}${NC} (user: ${THIS_USER}, ip: ${REGISTER_IP})"
+if systemctl is-active --quiet csm-agent 2>/dev/null; then
+echo -e "  ${GREEN}●${NC} CSM hub agent connected (real-time metrics + commands)"
+fi
 echo ""
-echo -e "  ${BOLD}On your manager PC, run:${NC}"
-echo -e "    ${CYAN}rtmux ls ${ALIAS}${NC}"
-echo -e "    ${CYAN}rtmux open ${ALIAS} main${NC}"
-echo -e "    ${CYAN}rtmux new ${ALIAS} claude${NC}"
-echo -e "    ${CYAN}rtmux dashboard${NC}"
+echo -e "  ${BOLD}On your manager PC:${NC}"
+echo -e "    ${CYAN}rtmux ls ${ALIAS}${NC}                  # list sessions"
+echo -e "    ${CYAN}rtmux open ${ALIAS} main${NC}            # open tmux session"
+echo -e "    ${CYAN}rtmux new ${ALIAS} claude${NC}           # new Claude session"
+echo -e "    ${CYAN}rtmux dashboard${NC}                   # fleet dashboard"
+if [[ -n "$MANAGER_TS_IP" ]]; then
 echo ""
-echo -e "  ${DIM}Manager has full control. No further setup needed on this PC.${NC}"
+echo -e "  ${BOLD}Dashboard:${NC} ${CYAN}http://${MANAGER_TS_IP}:${HUB_PORT}/dashboard/${NC}"
+fi
+echo ""
+echo -e "  ${DIM}No further setup needed on this PC. Everything auto-starts on reboot.${NC}"
