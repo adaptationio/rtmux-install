@@ -61,33 +61,39 @@ function sendEvent(ws, sessionId, eventType, data) {
 
 function handleCommand(ws, payload) {
   const { commandType, args } = payload;
-  console.log('[csm-agent] Command:', commandType);
+  console.log('[csm-agent] Command:', commandType, JSON.stringify(args));
   try {
     switch (commandType) {
       case 'create-session': {
-        const n = safeName(args.name || args.sessionId);
-        execFileSync('tmux', ['new-session', '-d', '-s', n, '-c', args.workingDir || '/tmp'], { timeout: 10000 });
-        sendEvent(ws, args.sessionId, 'state-change', { newState: 'active' });
+        const n = safeName(args.name || args.sessionName || args.sessionId);
+        const wd = args.workingDir || '/tmp';
+        execFileSync('tmux', ['new-session', '-d', '-s', n, '-c', wd], { timeout: 10000 });
+        console.log('[csm-agent] Created tmux session:', n);
+        sendEvent(ws, args.sessionId || n, 'state-change', { newState: 'active' });
         break;
       }
       case 'kill-session': {
-        const n = safeName(args.name || args.sessionId);
+        // Accept both sessionName and name for backwards compatibility
+        const n = safeName(args.sessionName || args.name || args.sessionId);
         execFileSync('tmux', ['kill-session', '-t', n], { timeout: 5000 });
+        console.log('[csm-agent] Killed tmux session:', n);
         break;
       }
       case 'send-keys': {
-        const n = safeName(args.name);
+        const n = safeName(args.sessionName || args.name);
         execFileSync('tmux', ['send-keys', '-t', n, args.keys || ''], { timeout: 5000 });
         break;
       }
       case 'capture-pane': {
-        const n = safeName(args.name);
+        const n = safeName(args.sessionName || args.name);
         const output = execFileSync('tmux', ['capture-pane', '-t', n, '-p'], { encoding: 'utf8', timeout: 5000 });
-        sendEvent(ws, args.name, 'terminal-output', { output });
+        sendEvent(ws, args.sessionId || n, 'terminal-output', { output });
         break;
       }
+      default:
+        console.log('[csm-agent] Unknown command:', commandType);
     }
-  } catch (err) { console.error('[csm-agent] Failed:', err.message); }
+  } catch (err) { console.error('[csm-agent] Command failed:', commandType, err.message); }
 }
 
 function connect() {
@@ -95,7 +101,8 @@ function connect() {
   const ws = new WebSocket(HUB_URL, { headers: { Authorization: 'Bearer ' + AUTH_TOKEN }, handshakeTimeout: 10000 });
 
   ws.on('open', () => {
-    ws.send(JSON.stringify({ type: 'register', payload: { hostname: HOSTNAME, platform: os.platform(), protocolVersion: 1, agentVersion: '1.0.0', resources: getResources(), activeSessions: getTmuxSessions() } }));
+    console.log('[csm-agent] Connected, registering...');
+    ws.send(JSON.stringify({ type: 'register', payload: { hostname: HOSTNAME, platform: os.platform(), protocolVersion: 1, agentVersion: '1.0.0-native', resources: getResources(), activeSessions: getTmuxSessions() } }));
     if (hbTimer) clearInterval(hbTimer);
     hbTimer = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'heartbeat', payload: { nodeId: nodeId || HOSTNAME, resources: getResources(), activeSessions: getTmuxSessions() } }));
@@ -105,16 +112,16 @@ function connect() {
   ws.on('message', (data) => {
     try {
       const msg = JSON.parse(data.toString());
-      if (msg.type === 'registered') { nodeId = msg.payload.nodeId; console.log('[csm-agent] Registered:', nodeId); }
+      if (msg.type === 'registered') { nodeId = msg.payload.nodeId; console.log('[csm-agent] Registered as:', nodeId); }
       else if (msg.type === 'relay-command') handleCommand(ws, msg.payload);
     } catch {}
   });
 
-  ws.on('close', () => { if (hbTimer) { clearInterval(hbTimer); hbTimer = null; } console.log('[csm-agent] Reconnecting in 5s...'); setTimeout(connect, 5000); });
+  ws.on('close', () => { if (hbTimer) { clearInterval(hbTimer); hbTimer = null; } console.log('[csm-agent] Disconnected. Reconnecting in 5s...'); setTimeout(connect, 5000); });
   ws.on('error', (err) => console.error('[csm-agent] Error:', err.message));
 }
 
-process.on('SIGTERM', () => { if (hbTimer) clearInterval(hbTimer); process.exit(0); });
-process.on('SIGINT', () => { if (hbTimer) clearInterval(hbTimer); process.exit(0); });
+process.on('SIGTERM', () => { console.log('[csm-agent] SIGTERM received, shutting down'); if (hbTimer) clearInterval(hbTimer); process.exit(0); });
+process.on('SIGINT', () => { console.log('[csm-agent] SIGINT received, shutting down'); if (hbTimer) clearInterval(hbTimer); process.exit(0); });
 
 connect();
